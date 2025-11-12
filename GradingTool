@@ -1,0 +1,260 @@
+# Project: 국가수준 학업성취도 평가 채점기 (객관/서답 별도 번호 + 서답 소문항 AND 매칭)
+# Author: Brian Lee
+# Scoring:
+#   LC = 46 - (LC_MC_wrong*2 + LC_SA_wrong*4)
+#   RC = 54 - (RC_MC_wrong*2 + RC_SA_wrong*4)
+# Numbering:
+#   객관: 1~34, 서답: 1~8
+#   LC = 객관 1~15 + 서답 1~3
+#   RC = 객관 16~34 + 서답 4~6
+#   서답 7~8은 기본 점수 미반영(옵션)
+
+# ===== 구성 상수 =====
+N_MC = 34
+N_SA = 8
+
+LC_MC_RANGE = (1, 15)         # 객관 1~15
+RC_MC_RANGE = (16, 34)        # 객관 16~34
+LC_SA_INDEX = [1, 2, 3]       # 서답 1~3
+RC_SA_INDEX = [4, 5, 6]       # 서답 4~6
+IGNORE_SA_INDEX = [7, 8]      # 기본 미포함
+
+LC_MAX = 46
+RC_MAX = 54
+
+# ===== 정답 키 =====
+# 객관: LC 15 + RC 19 = 총 34문항
+LC_MC_KEY = ["5","2","4","2","2","5","5","1","1","1","1","4","1","3","5"]
+RC_MC_KEY = ["2","4","3","3","4","2","3","3","1","4","3","5","4","1","5","2","3","5","4"]
+MC_KEY = LC_MC_KEY + RC_MC_KEY  # 길이 34
+
+# ===== 서답형 정답(소문항 AND 매칭) =====
+# 각 서답 번호마다 '소문항별 허용정답 목록의 리스트' 형태로 구성합니다.
+# 예) 4번: [["ride"], ["height"]] → 4-1에 ride 정답 중 하나 + 4-2에 height 정답 중 하나가 모두 맞아야 정답.
+#     1번: [["notebook"]] → 소문항이 1개뿐.
+SA_KEY_PARTS_RAW = {
+    1: ["notebook"],          # 소문항 1개
+    2: ["class", "ideas"],    # 소문항 2개 (둘 다 맞아야 정답)
+    3: ["tire"],              # 소문항 1개
+    4: ["ride", "height"],    # 소문항 2개
+    5: ["bird", "escape"],    # 소문항 2개
+    6: ["picture", "feeling"],# 소문항 2개
+
+}
+
+# ===== 유틸 =====
+def _sanitize(s: str) -> str:
+    return (s or "").strip().lower()
+
+def _validate_keys():
+    if len(MC_KEY) != N_MC:
+        raise ValueError(f"객관 정답 {len(MC_KEY)}개 → {N_MC}개 필요")
+    for i, v in enumerate(MC_KEY, start=1):
+        if v not in {"1","2","3","4","5"}:
+            raise ValueError(f"객관 {i}번 정답 '{v}' → '1'~'5'만 허용")
+    # SA_KEY_PARTS_RAW의 형태 점검(리스트 또는 빈 리스트)
+    for idx in range(1, N_SA+1):
+        parts = SA_KEY_PARTS_RAW.get(idx, [])
+        if not isinstance(parts, list):
+            raise ValueError(f"서답 {idx} 정답 형식 오류: 리스트여야 함")
+
+def _parse_mc_group(raw: str, need_len: int):
+    """
+    객관 입력 파싱:
+    - 허용: '1'~'5', '6'(무효/공란)
+    - 공백/쉼표/붙여쓰기 모두 가능
+    """
+    s = (raw or "").strip()
+    if "," in s or " " in s:
+        tokens = [t for t in s.replace(",", " ").split() if t]
+    else:
+        tokens = list(s)
+    cleaned = []
+    for t in tokens:
+        if t not in {"1","2","3","4","5","6"}:  # '6' = 무효/공란
+            return None
+        cleaned.append(t)
+    if len(cleaned) != need_len:
+        return None
+    return cleaned
+
+def _score_mc(stu, key, q_start):
+    """stu/key 동일 길이, q_start는 실제 객관 번호 시작(예: 1 또는 16)"""
+    wrong_nums = []
+    for i, (a, k) in enumerate(zip(stu, key)):
+        if a != k:  # '6' 포함 오답
+            wrong_nums.append(q_start + i)
+    return wrong_nums
+
+def _score_sa_and(stu_parts_dict, key_parts_dict):
+    """
+    AND 매칭 채점:
+    - key_parts_dict: {서답번호: [ [허용정답_소문항1_목록], [허용정답_소문항2_목록], ... ] }
+      (각 소문항은 '허용정답 문자열'들의 리스트. 모두 정답이어야 전체 정답)
+    - stu_parts_dict: {서답번호: [학생답_소문항1, 학생답_소문항2, ...]} (부족하면 빈 문자열로 보정)
+    반환: 오답(또는 불완전 정답)인 서답 번호 리스트
+    """
+    wrong = []
+    for idx, key_parts in key_parts_dict.items():
+        # 소문항 개수
+        n_parts = len(key_parts)
+        # 미사용(소문항 0개) → 채점에서 '오답'으로 처리(또는 제외 가능)
+        if n_parts == 0:
+            wrong.append(idx)
+            continue
+        # 학생답 확보 (부족분은 공란)
+        stu_list = stu_parts_dict.get(idx, [])
+        if len(stu_list) < n_parts:
+            stu_list = stu_list + [""] * (n_parts - len(stu_list))
+        # 모든 소문항이 각각의 허용 정답 중 하나와 '정확히' 일치해야 정답
+        ok_all = True
+        for part_ans, accept_list in zip(stu_list[:n_parts], key_parts):
+            s = _sanitize(part_ans)
+            variants = [_sanitize(x) for x in accept_list]
+            if s not in variants:
+                ok_all = False
+                break
+        if not ok_all:
+            wrong.append(idx)
+    return wrong
+
+def _clip(v, lo, hi):
+    return max(lo, min(hi, v))
+
+def _build_slice_for_range(seq, rng):
+    """seq에서 rng=(a,b) 포함 범위(1-indexed)를 부분배열로 뽑는다."""
+    a, b = rng
+    return seq[a-1:b]
+
+def main():
+    print("=== 국가수준 학업성취도 평가 채점기 (객관/서답 별도 번호 + 서답 소문항 AND 매칭) ===")
+    print("- 객관: 1~34, 서답: 1~8")
+    print("- LC = 객관 1~15 + 서답 1~3 / RC = 객관 16~34 + 서답 4~6")
+    print("- 객관 입력: 5문항씩(마지막은 4문항) → '1~6' 사용(6=무효/공란)")
+    print("- 서답 입력: 소문항별로 입력(예: 4-1, 4-2). 모든 소문항이 맞아야 정답.")
+    print("- 중간에 'r' 입력 시 재시작")
+
+    try:
+        _validate_keys()
+    except ValueError as e:
+        print("⚠️ 정답키 오류:", e)
+        return
+
+    # SA 키를 {번호: [ [허용정답_소문항1], [허용정답_소문항2], ... ]} 구조로 정리
+    SA_KEY_PARTS = {}
+    for idx in range(1, N_SA+1):
+        raw_parts = SA_KEY_PARTS_RAW.get(idx, [])
+        # raw_parts가 ["ride","height"]면 → [["ride"], ["height"]] 로 변환
+        normalized = []
+        for x in raw_parts:
+            if isinstance(x, list):
+                normalized.append([_sanitize(t) for t in x if str(t).strip() != ""])
+            else:
+                sx = str(x).strip()
+                if sx:
+                    normalized.append([_sanitize(sx)])
+        SA_KEY_PARTS[idx] = normalized  # 빈 리스트면 미사용 처리
+
+    while True:
+        restart = False
+        mc_ans = []
+
+        # ----- 객관 1~34 (5,5,5,5,5,5,4) -----
+        groups = [(1,5,5),(6,10,5),(11,15,5),(16,20,5),(21,25,5),(26,30,5),(31,34,4)]
+        for s, e, need in groups:
+            while True:
+                raw = input(f"객관 {s}~{e}번({need}개): ").strip()
+                if raw.lower() == "r":
+                    print("🔄 재채점 시작")
+                    restart = True
+                    break
+                parsed = _parse_mc_group(raw, need)
+                if parsed is None:
+                    print(f"❗ 형식 오류: 1~6만 사용, 정확히 {need}개 입력")
+                    continue
+                mc_ans.extend(parsed)
+                break
+            if restart:
+                break
+        if restart:
+            continue
+
+        # ----- 서답 1~8 (소문항별 입력) -----
+        # 각 번호에 대해 SA_KEY_PARTS의 소문항 개수만큼 입력 받음
+        sa_parts_ans = {}  # {번호: [답1, 답2, ...]}
+        for idx in range(1, N_SA+1):
+            key_parts = SA_KEY_PARTS.get(idx, [])
+            n_parts = len(key_parts)
+            if n_parts == 0:
+                # 미사용 자리: 스킵
+                continue
+            sa_parts_ans[idx] = []
+            for p in range(1, n_parts+1):
+                raw = input(f"서답 {idx}-{p} (문자열): ")
+                if raw is None:
+                    raw = ""
+                if isinstance(raw, str) and raw.lower().strip() == "r":
+                    print("🔄 재채점 시작")
+                    restart = True
+                    break
+                sa_parts_ans[idx].append(raw)
+            if restart:
+                break
+        if restart:
+            continue
+
+        # ===== 채점 분해 =====
+        # 객관 LC/RC 분리
+        mc_key_lc = _build_slice_for_range(MC_KEY, LC_MC_RANGE)
+        mc_key_rc = _build_slice_for_range(MC_KEY, RC_MC_RANGE)
+        mc_ans_lc = _build_slice_for_range(mc_ans, LC_MC_RANGE)
+        mc_ans_rc = _build_slice_for_range(mc_ans, RC_MC_RANGE)
+
+        lc_mc_wrong = _score_mc(mc_ans_lc, mc_key_lc, LC_MC_RANGE[0])
+        rc_mc_wrong = _score_mc(mc_ans_rc, mc_key_rc, RC_MC_RANGE[0])
+
+        # 서답 LC/RC 분리
+        sa_key_lc = {i: SA_KEY_PARTS[i] for i in LC_SA_INDEX}
+        sa_key_rc = {i: SA_KEY_PARTS[i] for i in RC_SA_INDEX}
+
+        # AND 매칭 채점
+        lc_sa_wrong = _score_sa_and({i: sa_parts_ans.get(i, []) for i in LC_SA_INDEX}, sa_key_lc)
+        rc_sa_wrong = _score_sa_and({i: sa_parts_ans.get(i, []) for i in RC_SA_INDEX}, sa_key_rc)
+
+        # ===== 점수 계산 =====
+        lc_mc_wrong_cnt = len(lc_mc_wrong)
+        lc_sa_wrong_cnt = len(lc_sa_wrong)
+        rc_mc_wrong_cnt = len(rc_mc_wrong)
+        rc_sa_wrong_cnt = len(rc_sa_wrong)
+
+        lc_raw = LC_MAX - (lc_mc_wrong_cnt*2 + lc_sa_wrong_cnt*4)
+        rc_raw = RC_MAX - (rc_mc_wrong_cnt*2 + rc_sa_wrong_cnt*4)
+
+        lc_score = _clip(lc_raw, 0, LC_MAX)
+        rc_score = _clip(rc_raw, 0, RC_MAX)
+        total = lc_score + rc_score
+        total_max = LC_MAX + RC_MAX
+
+        # ===== 출력 =====
+        print("\n[결과]")
+        print(f"LC: {lc_score}/{LC_MAX}  (객관 오답 {lc_mc_wrong_cnt}개, 서답 오답 {lc_sa_wrong_cnt}개)")
+        if lc_mc_wrong or lc_sa_wrong:
+            if lc_mc_wrong:
+                print(f" - LC 객관(1~15) 오답 번호: {', '.join(map(str, lc_mc_wrong))}")
+            if lc_sa_wrong:
+                # 소문항 AND 매칭이므로 '문항 번호'만 표기 (세부 소문항까지 표기 원하면 확장 가능)
+                print(f" - LC 서답(1~3) 오답 번호: {', '.join(map(str, lc_sa_wrong))}")
+
+        print(f"\nRC: {rc_score}/{RC_MAX}  (객관 오답 {rc_mc_wrong_cnt}개, 서답 오답 {rc_sa_wrong_cnt}개)")
+        if rc_mc_wrong or rc_sa_wrong:
+            if rc_mc_wrong:
+                print(f" - RC 객관(16~34) 오답 번호: {', '.join(map(str, rc_mc_wrong))}")
+            if rc_sa_wrong:
+                print(f" - RC 서답(4~6) 오답 번호: {', '.join(map(str, rc_sa_wrong))}")
+
+        # 참고: 서답 7~8은 기본 미반영
+        print(f"\n총점: {total}/{total_max}")
+        print("\n👉 다음 학생 채점 또는 'r'로 재시작 가능합니다.")
+
+if __name__ == "__main__":
+    main()
